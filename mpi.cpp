@@ -42,11 +42,13 @@ int* unflatten_index(int index, int y_size) {
     return result;
 }
 
+// get particle's grid position based on its position in current process
 void get_part_grid_index(particle_t& part, int& gx, int& gy) {
     gx = (int)floor(part.x / cutoff) - block_x * ngrid_per_block_x_global + 1;
     gy = (int)floor(part.y / cutoff) - block_y * ngrid_per_block_y_global + 1;
 }
 
+// get particle's grid index based on its position in current process
 int get_part_grid_id(int gx, int gy) {
     int grid_id = flatten_index(gx, gy, ngrid_per_block_y + 2);
     return grid_id;
@@ -99,7 +101,7 @@ static inline void apply_force_all(int gx, int gy, particle_t& part) {
             // If the neighbor is outside the grid, let's abondon it.
             if (px < 0 || px >= ngrid_per_block_x + 2 || py < 0 || py >= ngrid_per_block_y + 2) 
                 // printf("Error: the neighbor is outside the grid\n");
-                printf("px: %d, py: %d\n", px, py);
+                printf("Error: px: %d, py: %d is out of the bound.\n", px, py);
 
             // Assign the grid for this neighbor.
             grid_class* grid = &grids[flatten_index(px, py, ngrid_per_block_y + 2)];
@@ -181,14 +183,9 @@ void update_ghost_grid() {
 
     // Wait for all the grids to be received
     MPI_Waitall(cnt, request, MPI_STATUSES_IGNORE);
-}
 
-/*
-This function will move the particles from one block to another
-MPI_alltoallv is used to send the particles to the correct block
-*/
-void redistribute_parts() {
-
+    // Free the requests
+    free(request);
 }
 
 void init_simulation(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
@@ -256,6 +253,8 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
             grids[grid_id].num_p++;
         }
     }
+
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
@@ -276,30 +275,147 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
         }
     }
 
-    // std::map<int, std::vector<particle_t>> moved_particles;
+    std::map<int, std::vector<particle_t>> moved_particles;
 
-    // for (int i = 0; i < ngrid_per_block_x * ngrid_per_block_y; i++) {
-    //     if (0 != grids[i].num_p) {
-    //         for (int j = 0; j < MAX_P; j++) {
-    //             if (grids[i].members[j].id == 0) continue;
-    //             move(grids[i].members[j], size);
+    for (int i = 0; i < ngrid_per_block_x; i++) {
+        for (int j = 0; j < ngrid_per_block_y; j++) {
+            int grid_id = get_part_grid_id(i+1, j+1);
+            grid_class grid = grids[grid_id];
+            
+            if (0 != grid.num_p) {
+                for (int k = 0; k < MAX_P; k++) {
+                    if (grid.members[k].id == 0) continue;
+                    move(grid.members[k], size);
 
-    //             // If the particle is out of the block, we need to move it to the moved_particles array
-    //             int grid_id_x = (int)floor(parts[i].x / cutoff) - block_x * ngrid_per_block_x;
-    //             int grid_id_y = (int)floor(parts[i].y / cutoff) - block_y * ngrid_per_block_y;
+                    // If the particle is out of the block, we need to move it to the moved_particles array
+                    int gx_global, gy_global;
+                    int gx, gy;
 
-    //             if (grid_id_x < 0 || grid_id_x >= ngrid_per_block_x || grid_id_y < 0 || grid_id_y >= ngrid_per_block_y) {
-    //                 // moved_particles[]
-    //             }
-    //         }
-    //     }
-    // }
+                    get_part_grid_index(grid.members[k], gx, gy);
 
-    // redistribute_parts();
+                    gx_global = block_x * ngrid_per_block_x_global + gx - 1;
+                    gy_global = block_y * ngrid_per_block_y_global + gy - 1;
+
+                    // calculate the block index of the particle
+                    int bx = (int)floor((double) gx_global / (double) ngrid_per_block_x_global);
+                    int by = (int)floor((double) gy_global / (double) ngrid_per_block_y_global);
+
+                    // if the particle is out of the block, we need to move it to the moved_particles array
+                    if (bx != block_x || by != block_y) {
+                        int block_id = flatten_index(bx, by, nblock_y);
+                        particle_t part = grid.members[k];
+                        moved_particles[block_id].push_back(part);  
+                        grid.members[k].id = 0;
+                    } 
+                    // if the particle is still in the block, we need to update the grid
+                    else {
+                        int grid_id = get_part_grid_id(gx, gy);
+                        
+                        if (gx == i + 1 && gy == j + 1) continue;
+
+                        for (int kk = 0; kk < MAX_P; kk++) {
+                            if (grids[grid_id].members[kk].id == 0) {
+                                grids[grid_id].members[kk] = grid.members[k];
+                                grids[grid_id].num_p++;
+                                grid.members[k].id = 0;
+                                grid.num_p--;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    // redistribute the moved particles to its correct grid
+    // use MPI_alltoall to send the particle number,
+    // then use MPI_alltoallv to send the particles
+    int* send_counts = (int*)calloc(num_procs, sizeof(int));
+    int* recv_counts = (int*)calloc(num_procs, sizeof(int));
+    int* send_displs = (int*)calloc(num_procs, sizeof(int));
+    int* recv_displs = (int*)calloc(num_procs, sizeof(int));
+
+    for (auto it = moved_particles.begin(); it != moved_particles.end(); it++) {
+        int block_id = it->first;
+        int num_parts = it->second.size();
+        send_counts[block_id] = num_parts;
+        if (block_id == 0) {
+            send_displs[block_id] = 0;
+        } else {
+            send_displs[block_id] = send_displs[block_id - 1] + send_counts[block_id - 1];
+        }
+    }
+
+    MPI_Alltoall(send_counts, 1, MPI_INT, recv_counts, 1, MPI_INT, MPI_COMM_WORLD);
+
+    for (int i = 0; i < num_procs; i++) {
+        if (i == 0) {
+            recv_displs[i] = 0;
+        } else {
+            recv_displs[i] = recv_displs[i - 1] + recv_counts[i - 1];
+        }
+    }
+
+    int num_parts_sent = send_displs[num_procs - 1] + send_counts[num_procs - 1];
+    int num_parts_recv = recv_displs[num_procs - 1] + recv_counts[num_procs - 1];
+
+    particle_t* parts_sent = (particle_t*)calloc(num_parts_sent, sizeof(particle_t));
+    particle_t* parts_recv = (particle_t*)calloc(num_parts_recv, sizeof(particle_t));
+
+    for (auto it = moved_particles.begin(); it != moved_particles.end(); it++) {
+        int block_id = it->first;
+        int num_parts = it->second.size();
+        for (int i = 0; i < num_parts; i++) {
+            parts_sent[send_displs[block_id] + i] = it->second[i];
+        }
+    }
+
+    MPI_Alltoallv(
+        parts_sent, 
+        send_counts, 
+        send_displs, 
+        PARTICLE, 
+        parts_recv, 
+        recv_counts, 
+        recv_displs, 
+        PARTICLE, 
+        MPI_COMM_WORLD
+    );
+
+    // move the received particles to the correct grid
+    for (int i = 0; i < num_parts_recv; i++) {
+        int gx, gy;
+        get_part_grid_index(parts_recv[i], gx, gy);
+        int grid_id = get_part_grid_id(gx, gy);
+        for (int k = 0; k < MAX_P; k++) {
+            if (grids[grid_id].members[k].id == 0) {
+                grids[grid_id].members[k] = parts_recv[i];
+                grids[grid_id].num_p++;
+                break;
+            }
+        }
+    }
 }
 
 void gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
     // Write this function such that at the end of it, the master (rank == 0)
     // processor has an in-order view of all particles. That is, the array
     // parts is complete and sorted by particle id.
+
+    for (int i = 0; i < ngrid_per_block_x; i++) {
+        for (int j = 0; j < ngrid_per_block_y; j++) {
+            int grid_id = get_part_grid_id(i+1, j+1);
+            grid_class grid = grids[grid_id];
+            
+            if (0 != grid.num_p) {
+                for (int k = 0; k < MAX_P; k++) {
+                    if (grid.members[k].id == 0) continue;
+                    move(grid.members[k], size);
+                }
+            }
+        }
+    }
 }
