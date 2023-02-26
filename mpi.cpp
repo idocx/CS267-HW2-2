@@ -239,7 +239,6 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 
     grids = (grid_class*)calloc((ngrid_per_block_x + 2) * (ngrid_per_block_y + 2), sizeof(grid_class));
 
-    // TODO : parallelize this assigning process
     // go through all the particles, if they are in this block, assign them to the grids
     // the ghost grids are left empty
     for (int i = 0; i < num_parts; i++) {
@@ -257,9 +256,14 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
+int niter = 0;
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
     // // Exchange the ghost atoms with the neighboring blocks
-    // update_ghost_grid();
+    update_ghost_grid();
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    int cnt = 0;
 
     // Compute the forces on each particle
     for (int i = 0; i < ngrid_per_block_x; i++) {
@@ -268,12 +272,15 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
             if (0 != grids[grid_id].num_p) {
                 for (int k = 0; k < MAX_P; k++) {
                     if (grids[grid_id].members[k].id == 0) continue;
+                    cnt++;
                     particle_t part = grids[grid_id].members[k];
                     apply_force_all(i, j, part);
                 }
             }
         }
     }
+
+    printf("rank %d, cnt = %d, niter = %d\n", rank, cnt, niter++);
 
     std::map<int, std::vector<particle_t>> moved_particles;
 
@@ -306,8 +313,9 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
                         particle_t part = grid.members[k];
                         moved_particles[block_id].push_back(part);  
                         grid.members[k].id = 0;
+                        grid.num_p--;
                     } 
-                    // if the particle is still in the block, we need to update the grid
+                    // if the particle is still in the block, we need to update the grid locally
                     else {
                         int grid_id = get_part_grid_id(gx, gy);
                         
