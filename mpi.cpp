@@ -259,7 +259,7 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
     // // Exchange the ghost atoms with the neighboring blocks
-    update_ghost_grid();
+    // update_ghost_grid();
 
     // Compute the forces on each particle
     for (int i = 0; i < ngrid_per_block_x; i++) {
@@ -326,8 +326,6 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
                 }
             }
         }
-        
-        MPI_Barrier(MPI_COMM_WORLD);
     }
 
     // redistribute the moved particles to its correct grid
@@ -338,14 +336,17 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
     int* send_displs = (int*)calloc(num_procs, sizeof(int));
     int* recv_displs = (int*)calloc(num_procs, sizeof(int));
 
-    for (auto it = moved_particles.begin(); it != moved_particles.end(); it++) {
-        int block_id = it->first;
-        int num_parts = it->second.size();
-        send_counts[block_id] = num_parts;
-        if (block_id == 0) {
-            send_displs[block_id] = 0;
+    for (int i = 0; i < num_procs; i++) {
+        if (moved_particles.find(i) != moved_particles.end()) {
+            send_counts[i] = moved_particles[i].size();
         } else {
-            send_displs[block_id] = send_displs[block_id - 1] + send_counts[block_id - 1];
+            send_counts[i] = 0;
+        }
+
+        if (i == 0) {
+            send_displs[i] = 0;
+        } else {
+            send_displs[i] = send_displs[i - 1] + send_counts[i - 1];
         }
     }
 
@@ -398,6 +399,8 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
             }
         }
     }
+
+    MPI_Barrier(MPI_COMM_WORLD);
 
     free(send_counts);
     free(recv_counts);
