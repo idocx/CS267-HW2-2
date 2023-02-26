@@ -398,24 +398,21 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
             }
         }
     }
+
+    free(send_counts);
+    free(recv_counts);
+    free(send_displs);
+    free(recv_displs);
+    free(parts_sent);
+    free(parts_recv);
 }
 
 void gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
     // Write this function such that at the end of it, the master (rank == 0)
     // processor has an in-order view of all particles. That is, the array
     // parts is complete and sorted by particle id.
-
-    for (int i = 0; i < ngrid_per_block_x; i++) {
-        for (int j = 0; j < ngrid_per_block_y; j++) {
-            int grid_id = get_part_grid_id(i+1, j+1);
-            grid_class grid = grids[grid_id];
-            
-            if (0 != grid.num_p) {
-                for (int k = 0; k < MAX_P; k++) {
-                    if (grid.members[k].id == 0) continue;
-                    move(grid.members[k], size);
-                }
-            }
-        }
-    }
+    
+    // we will first send the number of particles to each processor
+    // then we will send the particles to each processor
+    // finally, we will gather the particles from each processor
 }
