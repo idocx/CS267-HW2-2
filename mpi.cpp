@@ -1,24 +1,35 @@
 #include "common.h"
 #include <mpi.h>
+#include <map>
+#include <cstddef>
+#include <chrono>
+#include <cmath>
+#include <vector>
+#include <cstdio>
 
 # define MAX_P 5
 
 int nblock_x, nblock_y;
 int ngrid;
+// the number of grids on X-axis and Y-axis for current processor
 int ngrid_per_block_x, ngrid_per_block_y;
+// the number of grids on X-axis and Y-axis for all processors
+int ngrid_per_block_x_global, ngrid_per_block_y_global;
 
 int block_x, block_y;
-
-// the grid that each processor has
-grid_class* grids;
-
-particle_t* moved_particles;
 
 // Put any static global variables here that you will use throughout the simulation.
 typedef struct grid_class {
     int num_p;
     particle_t members[MAX_P]; 
 } grid_class;
+
+
+// the grid that each processor has
+grid_class* grids;
+
+MPI_Datatype GRID;
+// the MPI request for sending and receiving the ghost grids
 
 int flatten_index(int x, int y, int y_size) {
     return x * y_size + y;
@@ -29,6 +40,16 @@ int* unflatten_index(int index, int y_size) {
     result[0] = index / y_size;
     result[1] = index % y_size;
     return result;
+}
+
+void get_part_grid_index(particle_t& part, int& gx, int& gy) {
+    gx = (int)floor(part.x / cutoff) - block_x * ngrid_per_block_x_global + 1;
+    gy = (int)floor(part.y / cutoff) - block_y * ngrid_per_block_y_global + 1;
+}
+
+int get_part_grid_id(int gx, int gy) {
+    int grid_id = flatten_index(gx, gy, ngrid_per_block_y + 2);
+    return grid_id;
 }
 
 // Apply the force from neighbor to particle
@@ -72,14 +93,16 @@ void move(particle_t& p, double size) {
     }
 }
 
-void apply_force_all(int gx, int gy, particle_t& part) {
+static inline void apply_force_all(int gx, int gy, particle_t& part) {
     for (int px = gx; px < gx + 3; px++) {
         for (int py = gy; py < gy + 3; py++) {
             // If the neighbor is outside the grid, let's abondon it.
-            if (px >= ngrid_per_block_x || py >= ngrid_per_block_y) continue;
+            if (px < 0 || px >= ngrid_per_block_x + 2 || py < 0 || py >= ngrid_per_block_y + 2) 
+                // printf("Error: the neighbor is outside the grid\n");
+                printf("px: %d, py: %d\n", px, py);
 
             // Assign the grid for this neighbor.
-            grid_class* grid = &grids[flatten_index(px, py, ngrid_per_block_y)];
+            grid_class* grid = &grids[flatten_index(px, py, ngrid_per_block_y + 2)];
 
             if (grid->num_p > 0) {
                 for (int j = 0; j < MAX_P; j++) {
@@ -97,24 +120,91 @@ void apply_force_all(int gx, int gy, particle_t& part) {
     }
 }
 
+void send_grid(grid_class* grid, int length, int dest, MPI_Request* request, int tag) {
+    MPI_Isend(grid, length, GRID, dest, tag, MPI_COMM_WORLD, request);
+}
+
+void receive_grid(grid_class* grid, int length, int source, MPI_Request* request, int tag) {
+    MPI_Irecv(grid, length, GRID, source, tag, MPI_COMM_WORLD, request);
+}
+
 /*
 This function will update the ghost grids on the boundary of the 
 block so that we can compute the force without communicating with other blocks.
 */
 void update_ghost_grid() {
+    int cnt = 0;
+    MPI_Request* request = (MPI_Request*)calloc(12 + ngrid_per_block_x * 4, sizeof(MPI_Request));
+
+    // Send and receive the grids on the top and bottom boundary
+    if (block_y != 0) {
+        for (int i = 0; i < ngrid_per_block_x; i++) {
+            send_grid(grids + flatten_index(i + 1, 1, ngrid_per_block_y + 2), 1, flatten_index(block_x, block_y - 1, nblock_y), request+cnt++, i+1);
+            receive_grid(grids + flatten_index(i + 1, 0, ngrid_per_block_y + 2), 1,flatten_index(block_x, block_y - 1, nblock_y), request+cnt++, i+1);
+        }
+    }
+    if (block_y != nblock_y - 1) {
+        for (int i = 0; i < ngrid_per_block_x; i++) {
+            send_grid(grids + flatten_index(i + 1, ngrid_per_block_y, ngrid_per_block_y + 2), 1, flatten_index(block_x, block_y + 1, nblock_y), request+cnt++, i+1);
+            receive_grid(grids + flatten_index(i + 1, ngrid_per_block_y + 1, ngrid_per_block_y + 2), 1, flatten_index(block_x, block_y + 1, nblock_y), request+cnt++, i+1);
+        }
+    }
+
+    // Send and receive the grids on the left and right boundary
+    if (block_x != 0) {
+        send_grid(grids + flatten_index(1, 1, ngrid_per_block_y + 2), ngrid_per_block_y, flatten_index(block_x - 1, block_y, nblock_y), request+cnt++, 0);
+        receive_grid(grids + flatten_index(0, 1, ngrid_per_block_y + 2), ngrid_per_block_y, flatten_index(block_x - 1, block_y, nblock_y), request+cnt++, 0);
+    }
+
+    if (block_x != nblock_x - 1) {
+        send_grid(grids + flatten_index(ngrid_per_block_x, 1, ngrid_per_block_y + 2), ngrid_per_block_y, flatten_index(block_x + 1, block_y, nblock_y), request+cnt++, 0);
+        receive_grid(grids + flatten_index(ngrid_per_block_x + 1, 1, ngrid_per_block_y + 2), ngrid_per_block_y, flatten_index(block_x + 1, block_y, nblock_y), request+cnt++, 0);
+    }
+
+    // Send and receive the grids on the corner
+    if (block_x != 0 && block_y != 0) {
+        send_grid(grids + flatten_index(1, 1, ngrid_per_block_y + 2), 1, flatten_index(block_x - 1, block_y - 1, nblock_y), request+cnt++, 0);
+        receive_grid(grids + flatten_index(0, 0, ngrid_per_block_y + 2), 1, flatten_index(block_x - 1, block_y - 1, nblock_y), request+cnt++, 0);
+    }
+    if (block_x != nblock_x - 1 && block_y != 0) {
+        send_grid(grids + flatten_index(ngrid_per_block_x, 1, ngrid_per_block_y + 2), 1, flatten_index(block_x + 1, block_y - 1, nblock_y), request+cnt++, 0);
+        receive_grid(grids + flatten_index(ngrid_per_block_x + 1, 0, ngrid_per_block_y + 2), 1, flatten_index(block_x + 1, block_y - 1, nblock_y), request+cnt++, 0);
+    }
+    if (block_x != 0 && block_y != nblock_y - 1) {
+        send_grid(grids + flatten_index(1, ngrid_per_block_y, ngrid_per_block_y + 2), 1, flatten_index(block_x - 1, block_y + 1, nblock_y), request+cnt++, 0);
+        receive_grid(grids + flatten_index(0, ngrid_per_block_y + 1, ngrid_per_block_y + 2), 1, flatten_index(block_x - 1, block_y + 1, nblock_y), request+cnt++, 0);
+    }
+    if (block_x != nblock_x - 1 && block_y != nblock_y - 1) {
+        send_grid(grids + flatten_index(ngrid_per_block_x, ngrid_per_block_y, ngrid_per_block_y + 2), 1, flatten_index(block_x + 1, block_y + 1, nblock_y), request+cnt++, 0);
+        receive_grid(grids + flatten_index(ngrid_per_block_x + 1, ngrid_per_block_y + 1, ngrid_per_block_y + 2), 1, flatten_index(block_x + 1, block_y + 1, nblock_y), request+cnt++, 0);
+    }
+
+    // Wait for all the grids to be received
+    MPI_Waitall(cnt, request, MPI_STATUSES_IGNORE);
 }
 
 /*
 This function will move the particles from one block to another
-
 MPI_alltoallv is used to send the particles to the correct block
 */
-void redistribute_parts() {}
+void redistribute_parts() {
+
+}
 
 void init_simulation(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
 	// You can use this space to initialize data objects that you may need
 	// This function will be called once before the algorithm begins
 	// Do not do any particle simulation here
+    // Create MPI Grid Type
+    const int nitems = 2;
+    int blocklengths[2] = {1, MAX_P};
+    MPI_Datatype types[2] = {MPI_INT, PARTICLE};
+    MPI_Aint offsets[2];
+    offsets[0] = offsetof(grid_class, num_p);
+    offsets[1] = offsetof(grid_class, members);
+    MPI_Type_create_struct(nitems, blocklengths, offsets, types, &GRID);
+    MPI_Type_commit(&GRID);
+
     ngrid = (int)ceil(size / cutoff);
 
     // we will divide the space into block_size[0] * block_size[1] blocks
@@ -128,26 +218,40 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     }
 
     // each block will have ngrid_per_block_x * ngrid_per_block_y grids
-    ngrid_per_block_x = (int)ceil(ngrid / nblock_x);
-    ngrid_per_block_y = (int)ceil(ngrid / nblock_y);
+    ngrid_per_block_x_global = (int)ceil((double) ngrid / (double) nblock_x);
+    ngrid_per_block_y_global = (int)ceil((double) ngrid / (double) nblock_y);
 
     // the position of the block in the block grid
     int* block_pos = unflatten_index(rank, nblock_y);
     block_x = block_pos[0];
     block_y = block_pos[1];
 
+    if ((block_x + 1) * ngrid_per_block_x_global > ngrid) {
+        ngrid_per_block_x = ngrid - block_x * ngrid_per_block_x_global;
+    } else {
+        ngrid_per_block_x = ngrid_per_block_x_global;
+    }
+
+    if ((block_y + 1) * ngrid_per_block_y_global > ngrid) {
+        ngrid_per_block_y = ngrid - block_y * ngrid_per_block_y_global;
+    } else {
+        ngrid_per_block_y = ngrid_per_block_y_global;
+    }
+
+    // printf("ngrid = %d, nblock_x = %d, nblock_y = %d, ngrid_per_block_x_global = %d, ngrid_per_block_y_global = %d, block_x = %d, block_y = %d, ngrid_per_block_x = %d, ngrid_per_block_y = %d\n", ngrid, nblock_x, nblock_y, ngrid_per_block_x_global, ngrid_per_block_y_global, block_x, block_y, ngrid_per_block_x, ngrid_per_block_y);
+
     grids = (grid_class*)calloc((ngrid_per_block_x + 2) * (ngrid_per_block_y + 2), sizeof(grid_class));
-    moved_particles = (particle_t*)calloc(nblock_x * nblock_y * MAX_P * 10, sizeof(particle_t));
 
     // TODO : parallelize this assigning process
     // go through all the particles, if they are in this block, assign them to the grids
     // the ghost grids are left empty
     for (int i = 0; i < num_parts; i++) {
-        int grid_id_x = (int)floor(parts[i].x / cutoff) - block_id_x * ngrid_per_block_x;
-        int grid_id_y = (int)floor(parts[i].y / cutoff) - block_id_y * ngrid_per_block_y;
+        int gx, gy;
+        get_part_grid_index(parts[i], gx, gy);
 
-        if (grid_id_x >= 0 && grid_id_x < ngrid_per_block_x && grid_id_y >= 0 && grid_id_y < ngrid_per_block_y) {
-            int grid_id = flatten_index(grid_id_x + 1, grid_id_y + 1, ngrid_per_block_y);
+        if (gx >= 1 && gx < ngrid_per_block_x + 1 && gy >= 1 && gy < ngrid_per_block_y + 1) {
+            // note that we have ghost grids on the edges, so we need to add 1 to the index
+            int grid_id = flatten_index(gx, gy, ngrid_per_block_y + 2);
             grids[grid_id].members[grids[grid_id].num_p] = parts[i];
             grids[grid_id].num_p++;
         }
@@ -155,39 +259,43 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
-    // Exchange the ghost atoms with the neighboring blocks
-    update_ghost_grids();
+    // // Exchange the ghost atoms with the neighboring blocks
+    update_ghost_grid();
 
     // Compute the forces on each particle
-    for(int i = 0; i < ngrid * ngrid; i++) {
-        if (0 != grids[i].num_p) {
-            for (int j = 0; j < MAX_P; j++) {
-                if (grids[i].members[j] == NULL) continue;
-                particle_t part = grids[i].members[j];
-                part.ax = part.ay = 0;
-                int gx = (int)(part.x / cutoff) - 1;
-                int gy = (int)(part.y / RANGE) - 1;
-                if(gx < 0) {
-                    gx = 0;
+    for (int i = 0; i < ngrid_per_block_x; i++) {
+        for (int j = 0; j < ngrid_per_block_y; j++) {
+            int grid_id = get_part_grid_id(i+1, j+1);
+            if (0 != grids[grid_id].num_p) {
+                for (int k = 0; k < MAX_P; k++) {
+                    if (grids[grid_id].members[k].id == 0) continue;
+                    particle_t part = grids[grid_id].members[k];
+                    apply_force_all(i, j, part);
                 }
-                if(gy < 0) {
-                    gy = 0;
-                }
-                apply_force_all(gx, gy, part);
             }
         }
     }
 
-    for (int i = 0; i < ngrids_per_block_x * ngrids_per_block_y; i++) {
-        if (0 != grids[i].num_p) {
-            for (int j = 0; j < MAX_P; j++) {
-                if (grids[i].members[j].id == 0) continue;
-                move(grids[i].members[j], size);
-            }
-        }
-    }
+    // std::map<int, std::vector<particle_t>> moved_particles;
 
-    redistribute_parts()
+    // for (int i = 0; i < ngrid_per_block_x * ngrid_per_block_y; i++) {
+    //     if (0 != grids[i].num_p) {
+    //         for (int j = 0; j < MAX_P; j++) {
+    //             if (grids[i].members[j].id == 0) continue;
+    //             move(grids[i].members[j], size);
+
+    //             // If the particle is out of the block, we need to move it to the moved_particles array
+    //             int grid_id_x = (int)floor(parts[i].x / cutoff) - block_x * ngrid_per_block_x;
+    //             int grid_id_y = (int)floor(parts[i].y / cutoff) - block_y * ngrid_per_block_y;
+
+    //             if (grid_id_x < 0 || grid_id_x >= ngrid_per_block_x || grid_id_y < 0 || grid_id_y >= ngrid_per_block_y) {
+    //                 // moved_particles[]
+    //             }
+    //         }
+    //     }
+    // }
+
+    // redistribute_parts();
 }
 
 void gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
