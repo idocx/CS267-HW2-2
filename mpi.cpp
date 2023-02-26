@@ -99,20 +99,17 @@ static inline void apply_force_all(int gx, int gy, particle_t& part) {
     for (int px = gx; px < gx + 3; px++) {
         for (int py = gy; py < gy + 3; py++) {
             // If the neighbor is outside the grid, let's abondon it.
-            if (px < 0 || px >= ngrid_per_block_x + 2 || py < 0 || py >= ngrid_per_block_y + 2) 
-                // printf("Error: the neighbor is outside the grid\n");
-                printf("Error: px: %d, py: %d is out of the bound.\n", px, py);
 
             // Assign the grid for this neighbor.
-            grid_class* grid = &grids[flatten_index(px, py, ngrid_per_block_y + 2)];
+            grid_class* grid = &grids[get_part_grid_id(px, py)];
 
-            if (grid->num_p > 0) {
+            if (grid->num_p != 0) {
                 for (int j = 0; j < MAX_P; j++) {
                     if (grid->members[j].id == 0) {
                         continue;
                     }
                     // If the neighbor is the particle itself, we don't need to consider the force.
-                    if (part.id == grid->members[j].id){
+                    if (part.id == grid->members[j].id) {
                         continue;
                     } 
                     apply_force(part, grid->members[j]);
@@ -235,8 +232,6 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
         ngrid_per_block_y = ngrid_per_block_y_global;
     }
 
-    // printf("ngrid = %d, nblock_x = %d, nblock_y = %d, ngrid_per_block_x_global = %d, ngrid_per_block_y_global = %d, block_x = %d, block_y = %d, ngrid_per_block_x = %d, ngrid_per_block_y = %d\n", ngrid, nblock_x, nblock_y, ngrid_per_block_x_global, ngrid_per_block_y_global, block_x, block_y, ngrid_per_block_x, ngrid_per_block_y);
-
     grids = (grid_class*)calloc((ngrid_per_block_x + 2) * (ngrid_per_block_y + 2), sizeof(grid_class));
 
     // go through all the particles, if they are in this block, assign them to the grids
@@ -256,15 +251,12 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
-int niter = 0;
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
     // // Exchange the ghost atoms with the neighboring blocks
     update_ghost_grid();
 
     MPI_Barrier(MPI_COMM_WORLD);
     
-    int cnt = 0;
-
     // Compute the forces on each particle
     for (int i = 0; i < ngrid_per_block_x; i++) {
         for (int j = 0; j < ngrid_per_block_y; j++) {
@@ -272,15 +264,12 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
             if (0 != grids[grid_id].num_p) {
                 for (int k = 0; k < MAX_P; k++) {
                     if (grids[grid_id].members[k].id == 0) continue;
-                    cnt++;
                     particle_t part = grids[grid_id].members[k];
                     apply_force_all(i, j, part);
                 }
             }
         }
     }
-
-    printf("rank %d, cnt = %d, niter = %d\n", rank, cnt, niter++);
 
     std::map<int, std::vector<particle_t>> moved_particles;
 
@@ -293,7 +282,19 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
                 for (int k = 0; k < MAX_P; k++) {
                     if (grid.members[k].id == 0) continue;
                     move(grid.members[k], size);
+                }
+            }
+        }
+    }
 
+    for (int i = 0; i < ngrid_per_block_x; i++) {
+        for (int j = 0; j < ngrid_per_block_y; j++) {
+            int grid_id = get_part_grid_id(i+1, j+1);
+            grid_class grid = grids[grid_id];
+
+            if (0 != grid.num_p) {
+                for (int k = 0; k < MAX_P; k++) {
+                    if (grid.members[k].id == 0) continue;
                     // If the particle is out of the block, we need to move it to the moved_particles array
                     int gx_global, gy_global;
                     int gx, gy;
@@ -319,6 +320,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
                     else {
                         int grid_id = get_part_grid_id(gx, gy);
                         
+                        // if the particle is still in the same grid, we don't need to do anything
                         if (gx == i + 1 && gy == j + 1) continue;
 
                         for (int kk = 0; kk < MAX_P; kk++) {
@@ -426,4 +428,75 @@ void gather_for_save(particle_t* parts, int num_parts, double size, int rank, in
     // we will first send the number of particles to each processor
     // then we will send the particles to each processor
     // finally, we will gather the particles from each processor
+
+    int num_parts_to_send = 0;
+
+    for (int i = 0; i < ngrid_per_block_x; i++) {
+        for (int j = 0; j < ngrid_per_block_y; j++) {
+            int grid_id = get_part_grid_id(i + 1, j + 1);
+            num_parts_to_send += grids[grid_id].num_p;
+        }
+    }
+
+    particle_t* parts_to_send = (particle_t*)calloc(num_parts_to_send, sizeof(particle_t));
+
+    // collect the particles from each grid
+    int index = 0;
+    for (int i = 0; i < ngrid_per_block_x; i++) {
+        for (int j = 0; j < ngrid_per_block_y; j++) {
+            int grid_id = get_part_grid_id(i + 1, j + 1);
+            for (int k = 0; k < MAX_P; k++) {
+                if (grids[grid_id].members[k].id != 0) {
+                    parts_to_send[index++] = grids[grid_id].members[k];
+                }
+            }
+        }
+    }
+
+    int* recv_counts = NULL;
+    int* recv_displs = NULL;
+    particle_t* parts_recv = NULL;
+
+    if (rank == 0) {
+        recv_counts = (int*)calloc(num_procs, sizeof(int));
+        recv_displs = (int*)calloc(num_procs, sizeof(int));
+        parts_recv = (particle_t*)calloc(num_parts, sizeof(particle_t));
+    }
+
+    MPI_Gather(&num_parts_to_send, 1, MPI_INT, recv_counts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        for (int i = 0; i < num_procs; i++) {
+            if (i == 0) {
+                recv_displs[i] = 0;
+            } else {
+                recv_displs[i] = recv_displs[i - 1] + recv_counts[i - 1];
+            }
+        }
+    }
+
+    MPI_Gatherv(
+        parts_to_send, 
+        num_parts_to_send, 
+        PARTICLE, 
+        parts_recv, 
+        recv_counts, 
+        recv_displs, 
+        PARTICLE, 
+        0, 
+        MPI_COMM_WORLD
+    );
+
+    if (rank == 0) {
+        for (int i = 0; i < num_parts; i++) {
+            uint64_t id = parts_recv[i].id;
+            parts[id - 1] = parts_recv[i];
+        }
+
+        free(recv_counts);
+        free(recv_displs);
+        free(parts_recv);
+    }
+
+    free(parts_to_send);
 }
